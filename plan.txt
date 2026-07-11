@@ -1,0 +1,366 @@
+Here's the expanded plan with the database given real weight — full schemas, constraints, indexes, and the reasoning behind each design choice.
+Phase 0 — Project Skeleton
+Folder structure
+shop-management/
+├── config/
+│   └── db.js
+├── db/
+│   └── schema.sql
+├── routes/
+├── controllers/
+├── middleware/
+├── public/
+│   ├── css/
+│   ├── js/
+│   └── *.html
+├── .env
+└── server.js
+Steps
+
+npm init -y
+npm install express mysql2 dotenv cors bcrypt jsonwebtoken
+npm install --save-dev nodemon
+.env with DB_HOST, DB_USER, DB_PASS, DB_NAME, JWT_SECRET, PORT
+server.js with one route: GET /health
+
+Test: npm run dev, hit /health, confirm JSON response.
+
+Phase 1 — Database Design (the important one)
+Don't just create tables — design them properly first. Here's the full schema with reasoning.
+1.1 Entity list
+categories, suppliers, products, customers, users, sales, sale_items, purchases, purchase_items, stock_logs
+1.2 Full schema
+sqlCREATE DATABASE shop_management;
+USE shop_management;
+
+-- Users (staff/admin who operate the system)
+CREATE TABLE users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('admin', 'staff') NOT NULL DEFAULT 'staff',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Categories
+CREATE TABLE categories (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    description VARCHAR(255)
+);
+
+-- Suppliers
+CREATE TABLE suppliers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    phone VARCHAR(20),
+    email VARCHAR(100),
+    address VARCHAR(255)
+);
+
+-- Products
+CREATE TABLE products (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    category_id INT,
+    supplier_id INT,
+    purchase_price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    selling_price DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    stock_quantity INT NOT NULL DEFAULT 0,
+    reorder_level INT NOT NULL DEFAULT 5,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL,
+    FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL,
+    CHECK (stock_quantity >= 0)
+);
+
+-- Customers
+CREATE TABLE customers (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    phone VARCHAR(20),
+    email VARCHAR(100),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Sales (header)
+CREATE TABLE sales (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    customer_id INT,
+    user_id INT NOT NULL,
+    total_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE SET NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- Sale items (line items)
+CREATE TABLE sale_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    sale_id INT NOT NULL,
+    product_id INT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10,2) NOT NULL,
+    subtotal DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    CHECK (quantity > 0)
+);
+
+-- Purchases (header) - restocking from suppliers
+CREATE TABLE purchases (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    supplier_id INT,
+    user_id INT NOT NULL,
+    total_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00,
+    purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- Purchase items
+CREATE TABLE purchase_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    purchase_id INT NOT NULL,
+    product_id INT NOT NULL,
+    quantity INT NOT NULL,
+    unit_cost DECIMAL(10,2) NOT NULL,
+    subtotal DECIMAL(10,2) NOT NULL,
+    FOREIGN KEY (purchase_id) REFERENCES purchases(id) ON DELETE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    CHECK (quantity > 0)
+);
+
+-- Stock logs - audit trail for every stock change
+CREATE TABLE stock_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    product_id INT NOT NULL,
+    change_type ENUM('sale', 'purchase', 'adjustment') NOT NULL,
+    quantity_change INT NOT NULL,     -- negative for sale, positive for purchase
+    reference_id INT,                  -- sale_id or purchase_id
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+1.3 Indexes (add after tables, for query performance)
+sqlCREATE INDEX idx_products_category ON products(category_id);
+CREATE INDEX idx_products_supplier ON products(supplier_id);
+CREATE INDEX idx_sale_items_sale ON sale_items(sale_id);
+CREATE INDEX idx_sale_items_product ON sale_items(product_id);
+CREATE INDEX idx_purchase_items_purchase ON purchase_items(purchase_id);
+CREATE INDEX idx_sales_date ON sales(sale_date);
+CREATE INDEX idx_stock_logs_product ON stock_logs(product_id);
+1.4 Design decisions worth understanding
+
+Header/line-item split (sales+sale_items, purchases+purchase_items) — this is standard normalization (like an invoice with multiple products). It's also why you need transactions later.
+ON DELETE SET NULL vs CASCADE — deleting a category shouldn't delete products, but deleting a sale should delete its line items.
+CHECK constraints — stock can never go negative at the DB level, not just in app code. Defense in depth.
+stock_logs — without this, you can't answer "why is stock at 12?" after the fact. This table is what makes your system auditable.
+DECIMAL, not FLOAT — for money, always. Floats introduce rounding errors.
+
+Test for this phase:
+
+Run the full schema.sql
+SHOW TABLES; — confirm 10 tables exist
+DESCRIBE products; — confirm columns/types
+Manually insert one row into categories, then suppliers, then products referencing both — confirm FK works
+Try inserting a product with a bogus category_id (e.g. 999) — confirm it's rejected (FK constraint working)
+Try inserting a product with stock_quantity = -5 — confirm it's rejected (CHECK constraint working)
+Delete a category that has a product — confirm the product's category_id becomes NULL, not an error
+
+
+Phase 2 — Node ↔ MySQL Connection Layer
+config/db.js:
+jsconst mysql = require('mysql2/promise');
+require('dotenv').config();
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASS,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+});
+
+module.exports = pool;
+Temporary test route:
+jsapp.get('/db-test', async (req, res) => {
+  const [rows] = await pool.query('SELECT 1+1 AS result');
+  res.json(rows);
+});
+Test: Hit /db-test, confirm [{result: 2}]. Then stop MySQL service and hit it again — confirm you get a clean error, not a server crash (tests your error handling works before you build on top of it).
+
+Phase 3 — Products CRUD (single table, manual SQL)
+Write every query by hand — no query builder syntax.
+js// GET all
+'SELECT * FROM products ORDER BY id DESC'
+
+// GET one
+'SELECT * FROM products WHERE id = ?'
+
+// CREATE
+`INSERT INTO products (name, category_id, supplier_id, purchase_price, selling_price, stock_quantity, reorder_level)
+ VALUES (?, ?, ?, ?, ?, ?, ?)`
+
+// UPDATE
+`UPDATE products SET name=?, category_id=?, supplier_id=?, purchase_price=?, selling_price=?, reorder_level=?
+ WHERE id=?`
+
+// DELETE
+'DELETE FROM products WHERE id = ?'
+Always use ? placeholders (parameterized queries) — never string-concatenate values into SQL. This is your SQL-injection protection.
+Test (via Postman/curl), in this exact order:
+
+POST /products with valid data → 201, check response has an id
+GET /products/:id → confirm the exact data you posted
+PUT /products/:id changing selling_price → GET again, confirm it changed
+DELETE /products/:id → GET again, confirm 404
+POST /products with an invalid category_id → confirm proper error (not a crash)
+POST /products with a name containing '; DROP TABLE products; -- → confirm it's stored as a harmless string, table still exists
+
+
+Phase 4 — Categories & Suppliers CRUD
+Same CRUD pattern as products, simpler tables.
+Test, with extra focus on FK behavior:
+
+Create a category, create a product using it
+Try to DELETE the category → since it's ON DELETE SET NULL, confirm the delete succeeds and the product's category_id is now NULL
+Repeat for suppliers
+
+
+Phase 5 — Users & Auth
+sql-- registration
+INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)
+
+-- login lookup
+SELECT * FROM users WHERE username = ?
+
+Hash password with bcrypt before insert — never store plaintext
+On login, bcrypt.compare(), then issue JWT with user.id and role
+Middleware: verifyToken checks header, requireAdmin checks role
+
+Test:
+
+Register → check DB directly, confirm password_hash is a bcrypt string, not the raw password
+Login with correct password → get token
+Login with wrong password → 401
+Call a protected route with no token → 401
+Call an admin-only route as a staff role → 403
+
+
+Phase 6 — Sales Module (multi-table transaction — the core requirement)
+This is where "multiple database operations" really shows. Use a single transaction across 3 operations.
+jsasync function createSale(customerId, userId, items) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // 1. Insert sale header (total calculated after items, so insert placeholder first or compute upfront)
+    const total = items.reduce((sum, i) => sum + i.quantity * i.unit_price, 0);
+    const [saleResult] = await conn.query(
+      'INSERT INTO sales (customer_id, user_id, total_amount) VALUES (?, ?, ?)',
+      [customerId, userId, total]
+    );
+    const saleId = saleResult.insertId;
+
+    for (const item of items) {
+      // 2. Check stock is sufficient
+      const [[product]] = await conn.query(
+        'SELECT stock_quantity, selling_price FROM products WHERE id = ? FOR UPDATE',
+        [item.productId]
+      );
+      if (!product || product.stock_quantity < item.quantity) {
+        throw new Error(`Insufficient stock for product ${item.productId}`);
+      }
+
+      // 3. Insert sale item
+      const subtotal = item.quantity * product.selling_price;
+      await conn.query(
+        'INSERT INTO sale_items (sale_id, product_id, quantity, unit_price, subtotal) VALUES (?, ?, ?, ?, ?)',
+        [saleId, item.productId, item.quantity, product.selling_price, subtotal]
+      );
+
+      // 4. Decrement stock
+      await conn.query(
+        'UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?',
+        [item.quantity, item.productId]
+      );
+
+      // 5. Log the stock change
+      await conn.query(
+        `INSERT INTO stock_logs (product_id, change_type, quantity_change, reference_id)
+         VALUES (?, 'sale', ?, ?)`,
+        [item.productId, -item.quantity, saleId]
+      );
+    }
+
+    await conn.commit();
+    return saleId;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+Key detail: SELECT ... FOR UPDATE locks the row during the transaction so two simultaneous sales can't both oversell the same stock (a real race condition risk in shop systems).
+Test — this needs the most rigor:
+
+Create a sale with 2 valid items → confirm sales, sale_items, products.stock_quantity, and stock_logs all updated correctly in one go
+Create a sale where item 2 requests more than available stock → confirm:
+
+The whole request fails
+No row was inserted into sales (check SELECT * FROM sales — nothing new)
+No row in sale_items
+products.stock_quantity is unchanged (this proves rollback worked)
+
+
+Open two terminal windows, fire two sales for the same low-stock product at nearly the same time → confirm stock never goes negative (tests the FOR UPDATE lock)
+
+
+Phase 7 — Purchases Module (mirrors Phase 6, opposite direction)
+Same transaction pattern: insert purchases header → insert purchase_items → increment products.stock_quantity → log to stock_logs with change_type='purchase'.
+Test: Same rollback and stock-log checks as Phase 6, but confirm stock goes up.
+
+Phase 8 — Reports (JOIN/aggregate-heavy queries)
+sql-- Low stock report
+SELECT id, name, stock_quantity, reorder_level
+FROM products
+WHERE stock_quantity <= reorder_level;
+
+-- Daily sales total
+SELECT DATE(sale_date) AS day, SUM(total_amount) AS total
+FROM sales
+GROUP BY DATE(sale_date)
+ORDER BY day DESC;
+
+-- Top selling products
+SELECT p.name, SUM(si.quantity) AS units_sold, SUM(si.subtotal) AS revenue
+FROM sale_items si
+JOIN products p ON si.product_id = p.id
+GROUP BY p.id
+ORDER BY units_sold DESC
+LIMIT 10;
+
+-- Sales with customer and staff names (multi-table JOIN)
+SELECT s.id, c.name AS customer, u.username AS staff, s.total_amount, s.sale_date
+FROM sales s
+LEFT JOIN customers c ON s.customer_id = c.id
+JOIN users u ON s.user_id = u.id
+ORDER BY s.sale_date DESC;
+Test: For each report, manually run the equivalent SQL yourself in MySQL Workbench and confirm the API's JSON output matches exactly.
+
+Phase 9 — Frontend (wire up already-tested APIs)
+Build and test one page at a time: Login → Products → Sales (cart-style) → Purchases → Dashboard/Reports.
+Test: For each page, perform the action in UI, then verify in MySQL directly (SELECT the relevant table) that the data matches what you did in the browser.
+
+Phase 10 — Final hardening
+
+Re-check every route uses ? placeholders (no template-literal SQL)
+Confirm all multi-step operations (sales, purchases) are wrapped in transactions
+Add stock_logs review as a report so students/reviewers can audit history
+
+Test: Attempt a SQL injection string in every input field across the whole app; attempt concurrent sales on low-stock items again as a final regression check.
+
+Want me to start writing the actual code for Phase 0 + Phase 1 (project setup and schema.sql) so you can run it right now?
